@@ -6,7 +6,6 @@ Keeps your original streaming logic & action throttling.
 
 from __future__ import annotations
 
-import concurrent.futures
 import re, textwrap, time
 from typing import List, Tuple
 
@@ -104,11 +103,31 @@ def _has_valid_format(block: str) -> bool:
     return block.lstrip().startswith("Thought:") and bool(_extract_actions(block))
 
 def _select_actions(actions: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
-    # Prefer the first Search if any; else run the very first action
-    for a, arg in actions:
-        if a == "search":
-            return [(a, arg)]
-    return [actions[0]]
+    """Return the actions to run this cycle.
+
+    If the model suggests a Search followed by an Open, execute both so the
+    requested page is fetched immediately.  Otherwise run only the first
+    action.  This preserves the "at most one action" rule for normal turns but
+    still honours explicit Open requests that accompany a Search.
+    """
+
+    if not actions:
+        return []
+
+    out: List[Tuple[str, str]] = []
+    first, rest = actions[0], actions[1:]
+
+    # Always run the first action
+    out.append(first)
+
+    # If it's a Search and the next action is Open, run that as well
+    if first[0] == "search":
+        for a, arg in rest:
+            if a == "open":
+                out.append((a, arg))
+                break
+
+    return out[:ACTION_LIMIT]
 
 # ─────────────────── prompt-construction helpers ─────────────────────
 def _build_system_prompt(q: str) -> str:
@@ -217,31 +236,22 @@ def run_research_agent(user_query: str, verbose: bool = False) -> None:
         for action, arg in actions_to_run:
             if action == "search":
                 formatted, results = web_search.search_web(arg, max_results=8)
-                obs = formatted
+                observations.append(formatted)
 
-                def _fetch(res):
+                for res in results[:AUTO_OPEN_TOP_K]:
                     url = res.get("href")
                     if not url:
-                        return None
+                        continue
                     snippet = mem.open_or_fetch(url, query=arg)
-                    return url, snippet
-
-                with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=THREAD_POOL_WORKERS
-                ) as pool:
-                    futures = [pool.submit(_fetch, r)
-                               for r in results[:AUTO_OPEN_TOP_K]]
-                    for f in concurrent.futures.as_completed(futures):
-                        res = f.result()
-                        if res:
-                            u, sn = res
-                            obs += f"\n\n[Auto-opened] {u}\nSnippet: {sn}…"
-                observations.append(obs)
+                    log = f"[Auto-opened] {url}\nSnippet: {snippet[:160]}…"
+                    mem.log_step(log)
+                    observations.append(log)
 
             elif action == "open":
                 snippet = mem.open_or_fetch(arg, query=user_query)
-                mem.log_step(f"[Open] {arg}\n{snippet[:160]}…")
-                observations.append(snippet)
+                log_msg = f"[Open] {arg}\n{snippet[:160]}…"
+                mem.log_step(log_msg)
+                observations.append(log_msg)
 
             elif action == "find":
                 if mem.last_page_text is None:
