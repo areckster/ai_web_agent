@@ -27,6 +27,9 @@ Start an interactive research session. The agent issues Search/Open/Find/Crawl/R
 python main.py research "what is the tallest building in Europe"
 ```
 
+The agent prints a short snippet whenever it opens a page, so you can
+verify that the requested URL was actually fetched.
+
 ### crawl
 Pre-crawl a domain so results are immediately available for Recall.
 
