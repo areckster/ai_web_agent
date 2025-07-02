@@ -19,7 +19,10 @@ MIN_SUPPORT_SOURCES  = 1
 SELF_CONSISTENCY_N   = 2
 THREAD_POOL_WORKERS  = 6
 MAX_HISTORY_CHARS    = 12_000
-ACTION_LIMIT         = 3
+# Max Action lines the LLM may emit per turn
+ACTION_LIMIT         = 4
+# Max Actions actually executed before the next user turn
+ACTIONS_PER_TURN     = 4
 CRAWL_MAX_PAGES      = 40
 # ──────────────────────────────────────────────────────────────────
 
@@ -126,12 +129,14 @@ def _build_system_prompt(q: str) -> str:
 
         Rules:
           0-a. First turn MUST be Action: Search("query") (paraphrase allowed).
-          0-b. After each Search, review the results and then use
+         0-b. After each Search, review the results and then use
                Action: Open("url") on the following turn.
-          1. Gather evidence from ≥{MIN_SUPPORT_SOURCES} distinct URLs.
-          2. The agent will execute at most **one** Action per cycle.
-          3. NEVER fabricate information; rely only on opened pages.
-          4. If evidence is insufficient, admit it instead of guessing.
+         1. Gather evidence from ≥{MIN_SUPPORT_SOURCES} distinct URLs.
+         2. The agent may execute up to **{ACTIONS_PER_TURN}** Actions per turn.
+            After each Action you will see an Observation before deciding what
+            to do next.
+         3. NEVER fabricate information; rely only on opened pages.
+         4. If evidence is insufficient, admit it instead of guessing.
 
         User question: "{q}"
         Begin.
@@ -194,82 +199,93 @@ def run_research_agent(user_query: str, verbose: bool = False) -> None:
         if verbose:
             print(f"\n— LOOP {loop} —")
 
-        hist = _trim_history(hist)
-        llm_out = _stream_until_actions(hist, verbose=verbose)
+        actions_run = 0
 
-        if not _has_valid_format(llm_out):
-            hist += "Observation: Reply must start with Thought: and contain an Action.\n"
-            continue
+        while actions_run < ACTIONS_PER_TURN:
+            hist = _trim_history(hist)
+            llm_out = _stream_until_actions(hist, verbose=verbose)
 
-        actions = _extract_actions(llm_out)
-        if not actions:
-            hist += "Observation: No valid Action detected; read instructions.\n"
-            continue
+            if not _has_valid_format(llm_out):
+                hist += "Observation: Reply must start with Thought: and contain an Action.\n"
+                continue
 
-        actions_to_run = _select_actions(actions)
-        observations: list[str] = []
+            actions = _extract_actions(llm_out)
+            if not actions:
+                hist += "Observation: No valid Action detected; read instructions.\n"
+                continue
 
-        # ---------- execute ≤1 tool ----------
-        for action, arg in actions_to_run:
-            if action == "search":
-                formatted, _ = web_search.search_web(arg, max_results=8)
-                observations.append(formatted)
+            actions_to_run = _select_actions(actions)
+            observations: list[str] = []
 
-            elif action == "open":
-                snippet = mem.open_or_fetch(arg, query=user_query)
-                log_msg = f"[Open] {arg}\n{snippet[:160]}…"
-                mem.log_step(log_msg)
-                observations.append(log_msg)
+            # ---------- execute one tool ----------
+            for action, arg in actions_to_run:
+                last_action = action
+                if action == "search":
+                    formatted, _ = web_search.search_web(arg, max_results=8)
+                    observations.append(formatted)
 
-            elif action == "find":
-                if mem.last_page_text is None:
-                    observations.append("Nothing open—use Open(url) first.")
-                else:
-                    hits = _find_chunks(mem.last_page_text, arg)
-                    observations.append("…\n".join(hits) if hits
-                                        else f"No occurrences of “{arg}”.")
+                elif action == "open":
+                    snippet = mem.open_or_fetch(arg, query=user_query)
+                    log_msg = f"[Open] {arg}\n{snippet[:160]}…"
+                    mem.log_step(log_msg)
+                    observations.append(log_msg)
 
-            # -------- new tools --------
-            elif action == "crawl":
-                pages = crawler.crawl_site(arg, max_pages=CRAWL_MAX_PAGES)
-                for url, html in pages.items():
-                    mem.add_web_content(url, html)
-                observations.append(f"Crawled {len(pages)} pages from {arg}")
+                elif action == "find":
+                    if mem.last_page_text is None:
+                        observations.append("Nothing open—use Open(url) first.")
+                    else:
+                        hits = _find_chunks(mem.last_page_text, arg)
+                        observations.append("…\n".join(hits) if hits
+                                            else f"No occurrences of “{arg}”.")
 
-            elif action == "recall":
-                hits = mem.vstore.similarity_search(arg, k=5)
-                if not hits:
-                    observations.append("No relevant docs yet – crawl first?")
-                else:
-                    out = []
-                    for url, score in hits:
-                        snip = mem.open_or_fetch(url, query=arg, auto_snippet=True)
-                        mem.log_step(f"[Recall] {url} ({score:.2f})\n{snip[:160]}…")
-                        out.append(f"[{score:.2f}] {url}\n{snip[:160]}…")
-                    observations.append("\n\n".join(out))
+                # -------- new tools --------
+                elif action == "crawl":
+                    pages = crawler.crawl_site(arg, max_pages=CRAWL_MAX_PAGES)
+                    for url, html in pages.items():
+                        mem.add_web_content(url, html)
+                    observations.append(f"Crawled {len(pages)} pages from {arg}")
 
-            elif action == "done":
-                if len(mem.sources) < MIN_SUPPORT_SOURCES:
-                    observations.append(
-                        f"Only {len(mem.sources)} source(s); need {MIN_SUPPORT_SOURCES}."
-                    )
-                else:
-                    answer = _summarise(user_query, mem.sources)
-                    print("\n— FINAL ANSWER —\n" + answer)
-                    return
+                elif action == "recall":
+                    hits = mem.vstore.similarity_search(arg, k=5)
+                    if not hits:
+                        observations.append("No relevant docs yet – crawl first?")
+                    else:
+                        out = []
+                        for url, score in hits:
+                            snip = mem.open_or_fetch(url, query=arg, auto_snippet=True)
+                            mem.log_step(f"[Recall] {url} ({score:.2f})\n{snip[:160]}…")
+                            out.append(f"[{score:.2f}] {url}\n{snip[:160]}…")
+                        observations.append("\n\n".join(out))
 
-            else:  # should never hit
-                warn = f"Unknown action “{action}”."
-                mem.log_step(warn)
-                observations.append(warn)
+                elif action == "done":
+                    if len(mem.sources) < MIN_SUPPORT_SOURCES:
+                        observations.append(
+                            f"Only {len(mem.sources)} source(s); need {MIN_SUPPORT_SOURCES}."
+                        )
+                    else:
+                        answer = _summarise(user_query, mem.sources)
+                        print("\n— FINAL ANSWER —\n" + answer)
+                        return
 
-        # ---------- update conversation history ----------
-        hist += f"{llm_out}\n\nObservation: {'\n----\n'.join(observations)}\n"
-        hist = _trim_history(hist)
-        if len(hist) > MAX_HISTORY_CHARS:
-            hist = hist[-MAX_HISTORY_CHARS:]
+                else:  # should never hit
+                    warn = f"Unknown action “{action}”."
+                    mem.log_step(warn)
+                    observations.append(warn)
 
-        time.sleep(0.2)
+            # ---------- update conversation history ----------
+            hist += f"{llm_out}\n\nObservation: {'\n----\n'.join(observations)}\n"
+            hist = _trim_history(hist)
+            if len(hist) > MAX_HISTORY_CHARS:
+                hist = hist[-MAX_HISTORY_CHARS:]
+
+            time.sleep(0.2)
+            actions_run += 1
+
+            if action == "done":
+                break
+
+        if action == "done":
+            break
 
     print("\n— MAX LOOPS REACHED —")
     print(_summarise(user_query, mem.sources))
