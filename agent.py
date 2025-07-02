@@ -33,6 +33,24 @@ _TOKEN_RE = re.compile(r"[A-Za-z0-9']+")
 def _words(t: str) -> set[str]:
     return {w.lower() for w in _TOKEN_RE.findall(t) if len(w) > 3}
 
+def _trim_history(text: str, reserve: int = 400) -> str:
+    """Trim history so that token count fits within the model context."""
+    try:
+        max_in = _llm.n_ctx() - reserve
+        tokens = _llm.tokenize(text.encode())
+    except Exception:
+        return text[-MAX_HISTORY_CHARS:]
+    if len(tokens) <= max_in:
+        return text
+    keep = tokens[-max_in:]
+    try:
+        trimmed = _llm.detokenize(keep).decode("utf-8", "ignore")
+    except Exception:
+        ratio = max_in / len(tokens)
+        keep_chars = int(len(text) * ratio)
+        trimmed = text[-keep_chars:]
+    return trimmed
+
 def _find_chunks(text: str, needle: str,
                  context: int = 120, max_hits: int = 3) -> list[str]:
     lowered, pos, out = text.lower(), 0, []
@@ -49,10 +67,11 @@ def _find_chunks(text: str, needle: str,
 
 # ────────────── Action-parsing helpers (multi-action aware) ───────────
 _ACTION_RE = re.compile(
-    r'^Action:\s*(Search|Open|Find|Crawl|Recall)\s*\(\s*["\']?(.*?)["\']?\s*\)\s*$',
+    r'^Action:\s*(\w+)\s*\(\s*["\']?(.*?)["\']?\s*\)\s*$',
     re.I,
 )
 _DONE_RE   = re.compile(r"^Action:\s*Done!\s*$", re.I)
+_SUPPORTED = {"search", "open", "find", "crawl", "recall", "done"}
 
 def _parse_single_action(line: str) -> Tuple[str, str] | None:
     if _DONE_RE.match(line):
@@ -60,7 +79,11 @@ def _parse_single_action(line: str) -> Tuple[str, str] | None:
     m = _ACTION_RE.match(line)
     if m:
         verb, arg = m.groups()
-        return (verb.lower(), arg.strip())
+        verb_l = verb.lower()
+        if verb_l not in _SUPPORTED:
+            print(f"[Warning] Ignoring unsupported action '{verb}'.")
+            return None
+        return (verb_l, (arg or "").strip())
     return None
 
 def _extract_actions(block: str,
@@ -110,6 +133,8 @@ def _build_system_prompt(q: str) -> str:
           0-b. After each Search, immediately Open one promising URL.
           1. Gather evidence from ≥{MIN_SUPPORT_SOURCES} distinct URLs.
           2. The agent will execute at most **one** Action per cycle.
+          3. NEVER fabricate information; rely only on opened pages.
+          4. If evidence is insufficient, admit it instead of guessing.
 
         User question: "{q}"
         Begin.
@@ -133,27 +158,31 @@ def _stream_until_actions(prompt: str, verbose: bool = False) -> str:
     actions: list[tuple[str, str]] = []
     max_tokens = _budget(prompt, reserve_ctx=400, hard_cap=None)
 
-    for chunk in _llm(
-        prompt,
-        max_tokens=max_tokens,
-        temperature=0.32,
-        top_p=0.8,
-        repeat_penalty=1.15,
-        stop=["Observation:"],
-        stream=True,
-    ):
-        tok = chunk["choices"][0]["text"]
-        out += tok
-        curr_line += tok
-        if verbose:
-            print(tok, end="", flush=True)
-        if tok.endswith("\n"):
-            maybe = _parse_single_action(curr_line.strip())
-            if maybe:
-                actions.append(maybe)
-                if len(actions) >= ACTION_LIMIT or maybe[0] == "done":
-                    break
-            curr_line = ""
+    try:
+        for chunk in _llm(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=0.32,
+            top_p=0.8,
+            repeat_penalty=1.15,
+            stop=["Observation:"],
+            stream=True,
+        ):
+            tok = chunk["choices"][0]["text"]
+            out += tok
+            curr_line += tok
+            if verbose:
+                print(tok, end="", flush=True)
+            if tok.endswith("\n"):
+                maybe = _parse_single_action(curr_line.strip())
+                if maybe:
+                    actions.append(maybe)
+                    if len(actions) >= ACTION_LIMIT or maybe[0] == "done":
+                        break
+                curr_line = ""
+    except Exception as e:
+        print(f"⚠️ LLM decoding error: {e}")
+        return ""
     if verbose:
         print()
     return out.strip()
@@ -169,6 +198,7 @@ def run_research_agent(user_query: str, verbose: bool = False) -> None:
         if verbose:
             print(f"\n— LOOP {loop} —")
 
+        hist = _trim_history(hist)
         llm_out = _stream_until_actions(hist, verbose=verbose)
 
         if not _has_valid_format(llm_out):
@@ -209,7 +239,9 @@ def run_research_agent(user_query: str, verbose: bool = False) -> None:
                 observations.append(obs)
 
             elif action == "open":
-                observations.append(mem.open_or_fetch(arg, query=user_query))
+                snippet = mem.open_or_fetch(arg, query=user_query)
+                mem.log_step(f"[Open] {arg}\n{snippet[:160]}…")
+                observations.append(snippet)
 
             elif action == "find":
                 if mem.last_page_text is None:
@@ -234,6 +266,7 @@ def run_research_agent(user_query: str, verbose: bool = False) -> None:
                     out = []
                     for url, score in hits:
                         snip = mem.open_or_fetch(url, query=arg, auto_snippet=True)
+                        mem.log_step(f"[Recall] {url} ({score:.2f})\n{snip[:160]}…")
                         out.append(f"[{score:.2f}] {url}\n{snip[:160]}…")
                     observations.append("\n\n".join(out))
 
@@ -248,10 +281,13 @@ def run_research_agent(user_query: str, verbose: bool = False) -> None:
                     return
 
             else:  # should never hit
-                observations.append(f"Unknown action “{action}”.")
+                warn = f"Unknown action “{action}”."
+                mem.log_step(warn)
+                observations.append(warn)
 
         # ---------- update conversation history ----------
         hist += f"{llm_out}\n\nObservation: {'\n----\n'.join(observations)}\n"
+        hist = _trim_history(hist)
         if len(hist) > MAX_HISTORY_CHARS:
             hist = hist[-MAX_HISTORY_CHARS:]
 

@@ -38,10 +38,11 @@ class Memory:
     # ---------- cache helpers ----------
     def add_web_content(self, url: str, html: str) -> None:
         """Store raw HTML and push plain-text into the vector store."""
-        self.cache[url] = html
         text = parser.parse_html(html)
-        if text:
-            self.vstore.add(url, text)
+        if not text.strip():
+            return  # skip empty pages
+        self.cache[url] = html
+        self.vstore.add(url, text)
 
     def get_web_content(self, url: str) -> str | None:
         return self.cache.get(url)
@@ -67,6 +68,8 @@ class Memory:
             return f"⚠️ Failed to fetch {url}"
 
         text = parser.parse_html(html)
+        if not text.strip():
+            return f"⚠️ Empty page at {url}"
         self.last_opened_url = url
         self.last_page_text = text
 

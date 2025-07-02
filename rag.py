@@ -23,6 +23,7 @@ class MiniVectorStore:
     def __init__(self):
         self.docs = []          # list[tuple[url, tokens, tfidf]]
         self.idf  = Counter()
+        self._finalised = False
 
     def add(self, url, text):
         toks = _tokens(text)
@@ -30,6 +31,7 @@ class MiniVectorStore:
             return
         self.docs.append((url, toks, None))
         self.idf.update(set(toks))
+        self._finalised = False
 
     def _finalize(self):
         N = len(self.docs) or 1
@@ -38,15 +40,16 @@ class MiniVectorStore:
 
         for i, (url, toks, _) in enumerate(self.docs):
             self.docs[i] = (url, toks, _tfidf_vector(toks, self.idf))
+        self._finalised = True
 
     def similarity_search(self, query, k=5):
-        if self.docs and self.docs[0][2] is None:
+        if self.docs and not self._finalised:
             self._finalize()
 
         q_vec = _tfidf_vector(_tokens(query), self.idf)
         scored = []
         for url, _, doc_vec in self.docs:
-            if doc_vec is not None and doc_vec:  # skip empty or None vectors
+            if doc_vec:
                 sim = _cosine(doc_vec, q_vec)
                 scored.append((url, sim))
         return sorted(scored, key=lambda x: x[1], reverse=True)[:k]
