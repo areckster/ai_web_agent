@@ -6,7 +6,6 @@ Keeps your original streaming logic & action throttling.
 
 from __future__ import annotations
 
-import concurrent.futures
 import re, textwrap, time
 from typing import List, Tuple
 
@@ -18,7 +17,6 @@ import crawler            # ← new helper module
 MAX_LOOPS            = 4
 MIN_SUPPORT_SOURCES  = 1
 SELF_CONSISTENCY_N   = 2
-AUTO_OPEN_TOP_K      = 1
 THREAD_POOL_WORKERS  = 6
 MAX_HISTORY_CHARS    = 12_000
 ACTION_LIMIT         = 3
@@ -32,6 +30,24 @@ _TOKEN_RE = re.compile(r"[A-Za-z0-9']+")
 # ─────────────────────── utility helpers ────────────────────────
 def _words(t: str) -> set[str]:
     return {w.lower() for w in _TOKEN_RE.findall(t) if len(w) > 3}
+
+def _trim_history(text: str, reserve: int = 400) -> str:
+    """Trim history so that token count fits within the model context."""
+    try:
+        max_in = _llm.n_ctx() - reserve
+        tokens = _llm.tokenize(text.encode())
+    except Exception:
+        return text[-MAX_HISTORY_CHARS:]
+    if len(tokens) <= max_in:
+        return text
+    keep = tokens[-max_in:]
+    try:
+        trimmed = _llm.detokenize(keep).decode("utf-8", "ignore")
+    except Exception:
+        ratio = max_in / len(tokens)
+        keep_chars = int(len(text) * ratio)
+        trimmed = text[-keep_chars:]
+    return trimmed
 
 def _find_chunks(text: str, needle: str,
                  context: int = 120, max_hits: int = 3) -> list[str]:
@@ -49,10 +65,11 @@ def _find_chunks(text: str, needle: str,
 
 # ────────────── Action-parsing helpers (multi-action aware) ───────────
 _ACTION_RE = re.compile(
-    r'^Action:\s*(Search|Open|Find|Crawl|Recall)\s*\(\s*["\']?(.*?)["\']?\s*\)\s*$',
+    r'^Action:\s*(\w+)\s*\(\s*["\']?(.*?)["\']?\s*\)\s*$',
     re.I,
 )
 _DONE_RE   = re.compile(r"^Action:\s*Done!\s*$", re.I)
+_SUPPORTED = {"search", "open", "find", "crawl", "recall", "done"}
 
 def _parse_single_action(line: str) -> Tuple[str, str] | None:
     if _DONE_RE.match(line):
@@ -60,7 +77,11 @@ def _parse_single_action(line: str) -> Tuple[str, str] | None:
     m = _ACTION_RE.match(line)
     if m:
         verb, arg = m.groups()
-        return (verb.lower(), arg.strip())
+        verb_l = verb.lower()
+        if verb_l not in _SUPPORTED:
+            print(f"[Warning] Ignoring unsupported action '{verb}'.")
+            return None
+        return (verb_l, (arg or "").strip())
     return None
 
 def _extract_actions(block: str,
@@ -81,11 +102,9 @@ def _has_valid_format(block: str) -> bool:
     return block.lstrip().startswith("Thought:") and bool(_extract_actions(block))
 
 def _select_actions(actions: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
-    # Prefer the first Search if any; else run the very first action
-    for a, arg in actions:
-        if a == "search":
-            return [(a, arg)]
-    return [actions[0]]
+    """Return the first suggested action only."""
+
+    return actions[:1] if actions else []
 
 # ─────────────────── prompt-construction helpers ─────────────────────
 def _build_system_prompt(q: str) -> str:
@@ -107,9 +126,12 @@ def _build_system_prompt(q: str) -> str:
 
         Rules:
           0-a. First turn MUST be Action: Search("query") (paraphrase allowed).
-          0-b. After each Search, immediately Open one promising URL.
+          0-b. After each Search, review the results and then use
+               Action: Open("url") on the following turn.
           1. Gather evidence from ≥{MIN_SUPPORT_SOURCES} distinct URLs.
           2. The agent will execute at most **one** Action per cycle.
+          3. NEVER fabricate information; rely only on opened pages.
+          4. If evidence is insufficient, admit it instead of guessing.
 
         User question: "{q}"
         Begin.
@@ -133,27 +155,30 @@ def _stream_until_actions(prompt: str, verbose: bool = False) -> str:
     actions: list[tuple[str, str]] = []
     max_tokens = _budget(prompt, reserve_ctx=400, hard_cap=None)
 
-    for chunk in _llm(
-        prompt,
-        max_tokens=max_tokens,
-        temperature=0.32,
-        top_p=0.8,
-        repeat_penalty=1.15,
-        stop=["Observation:"],
-        stream=True,
-    ):
-        tok = chunk["choices"][0]["text"]
-        out += tok
-        curr_line += tok
-        if verbose:
-            print(tok, end="", flush=True)
-        if tok.endswith("\n"):
-            maybe = _parse_single_action(curr_line.strip())
-            if maybe:
-                actions.append(maybe)
-                if len(actions) >= ACTION_LIMIT or maybe[0] == "done":
-                    break
-            curr_line = ""
+    try:
+        for chunk in _llm(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=0.32,
+            top_p=0.8,
+            repeat_penalty=1.15,
+            stop=["Observation:"],
+            stream=True,
+        ):
+            tok = chunk["choices"][0]["text"]
+            out += tok
+            curr_line += tok
+            if verbose:
+                print(tok, end="", flush=True)
+            if tok.endswith("\n"):
+                maybe = _parse_single_action(curr_line.strip())
+                if maybe:
+                    actions.append(maybe)
+                    break  # run action immediately
+                curr_line = ""
+    except Exception as e:
+        print(f"⚠️ LLM decoding error: {e}")
+        return ""
     if verbose:
         print()
     return out.strip()
@@ -169,6 +194,7 @@ def run_research_agent(user_query: str, verbose: bool = False) -> None:
         if verbose:
             print(f"\n— LOOP {loop} —")
 
+        hist = _trim_history(hist)
         llm_out = _stream_until_actions(hist, verbose=verbose)
 
         if not _has_valid_format(llm_out):
@@ -186,30 +212,14 @@ def run_research_agent(user_query: str, verbose: bool = False) -> None:
         # ---------- execute ≤1 tool ----------
         for action, arg in actions_to_run:
             if action == "search":
-                formatted, results = web_search.search_web(arg, max_results=8)
-                obs = formatted
-
-                def _fetch(res):
-                    url = res.get("href")
-                    if not url:
-                        return None
-                    snippet = mem.open_or_fetch(url, query=arg)
-                    return url, snippet
-
-                with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=THREAD_POOL_WORKERS
-                ) as pool:
-                    futures = [pool.submit(_fetch, r)
-                               for r in results[:AUTO_OPEN_TOP_K]]
-                    for f in concurrent.futures.as_completed(futures):
-                        res = f.result()
-                        if res:
-                            u, sn = res
-                            obs += f"\n\n[Auto-opened] {u}\nSnippet: {sn}…"
-                observations.append(obs)
+                formatted, _ = web_search.search_web(arg, max_results=8)
+                observations.append(formatted)
 
             elif action == "open":
-                observations.append(mem.open_or_fetch(arg, query=user_query))
+                snippet = mem.open_or_fetch(arg, query=user_query)
+                log_msg = f"[Open] {arg}\n{snippet[:160]}…"
+                mem.log_step(log_msg)
+                observations.append(log_msg)
 
             elif action == "find":
                 if mem.last_page_text is None:
@@ -234,6 +244,7 @@ def run_research_agent(user_query: str, verbose: bool = False) -> None:
                     out = []
                     for url, score in hits:
                         snip = mem.open_or_fetch(url, query=arg, auto_snippet=True)
+                        mem.log_step(f"[Recall] {url} ({score:.2f})\n{snip[:160]}…")
                         out.append(f"[{score:.2f}] {url}\n{snip[:160]}…")
                     observations.append("\n\n".join(out))
 
@@ -248,10 +259,13 @@ def run_research_agent(user_query: str, verbose: bool = False) -> None:
                     return
 
             else:  # should never hit
-                observations.append(f"Unknown action “{action}”.")
+                warn = f"Unknown action “{action}”."
+                mem.log_step(warn)
+                observations.append(warn)
 
         # ---------- update conversation history ----------
         hist += f"{llm_out}\n\nObservation: {'\n----\n'.join(observations)}\n"
+        hist = _trim_history(hist)
         if len(hist) > MAX_HISTORY_CHARS:
             hist = hist[-MAX_HISTORY_CHARS:]
 
