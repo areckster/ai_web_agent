@@ -1,0 +1,16 @@
+# Core Libraries
+requests
+beautifulsoup4
+duckduckgo-search
+transformers
+torch
+fake_useragent
+click
+
+# --- Optional Libraries ---
+# For advanced scraping of JavaScript-heavy sites
+selenium
+undetected-chromedriver
+
+# For alternative LLM implementation
+llama-cpp-python
