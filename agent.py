@@ -17,7 +17,6 @@ import crawler            # ← new helper module
 MAX_LOOPS            = 4
 MIN_SUPPORT_SOURCES  = 1
 SELF_CONSISTENCY_N   = 2
-AUTO_OPEN_TOP_K      = 1
 THREAD_POOL_WORKERS  = 6
 MAX_HISTORY_CHARS    = 12_000
 ACTION_LIMIT         = 3
@@ -103,31 +102,9 @@ def _has_valid_format(block: str) -> bool:
     return block.lstrip().startswith("Thought:") and bool(_extract_actions(block))
 
 def _select_actions(actions: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
-    """Return the actions to run this cycle.
+    """Return the first suggested action only."""
 
-    If the model suggests a Search followed by an Open, execute both so the
-    requested page is fetched immediately.  Otherwise run only the first
-    action.  This preserves the "at most one action" rule for normal turns but
-    still honours explicit Open requests that accompany a Search.
-    """
-
-    if not actions:
-        return []
-
-    out: List[Tuple[str, str]] = []
-    first, rest = actions[0], actions[1:]
-
-    # Always run the first action
-    out.append(first)
-
-    # If it's a Search and the next action is Open, run that as well
-    if first[0] == "search":
-        for a, arg in rest:
-            if a == "open":
-                out.append((a, arg))
-                break
-
-    return out[:ACTION_LIMIT]
+    return actions[:1] if actions else []
 
 # ─────────────────── prompt-construction helpers ─────────────────────
 def _build_system_prompt(q: str) -> str:
@@ -149,7 +126,8 @@ def _build_system_prompt(q: str) -> str:
 
         Rules:
           0-a. First turn MUST be Action: Search("query") (paraphrase allowed).
-          0-b. After each Search, immediately Open one promising URL.
+          0-b. After each Search, review the results and then use
+               Action: Open("url") on the following turn.
           1. Gather evidence from ≥{MIN_SUPPORT_SOURCES} distinct URLs.
           2. The agent will execute at most **one** Action per cycle.
           3. NEVER fabricate information; rely only on opened pages.
@@ -196,8 +174,7 @@ def _stream_until_actions(prompt: str, verbose: bool = False) -> str:
                 maybe = _parse_single_action(curr_line.strip())
                 if maybe:
                     actions.append(maybe)
-                    if len(actions) >= ACTION_LIMIT or maybe[0] == "done":
-                        break
+                    break  # run action immediately
                 curr_line = ""
     except Exception as e:
         print(f"⚠️ LLM decoding error: {e}")
@@ -235,17 +212,8 @@ def run_research_agent(user_query: str, verbose: bool = False) -> None:
         # ---------- execute ≤1 tool ----------
         for action, arg in actions_to_run:
             if action == "search":
-                formatted, results = web_search.search_web(arg, max_results=8)
+                formatted, _ = web_search.search_web(arg, max_results=8)
                 observations.append(formatted)
-
-                for res in results[:AUTO_OPEN_TOP_K]:
-                    url = res.get("href")
-                    if not url:
-                        continue
-                    snippet = mem.open_or_fetch(url, query=arg)
-                    log = f"[Auto-opened] {url}\nSnippet: {snippet[:160]}…"
-                    mem.log_step(log)
-                    observations.append(log)
 
             elif action == "open":
                 snippet = mem.open_or_fetch(arg, query=user_query)
